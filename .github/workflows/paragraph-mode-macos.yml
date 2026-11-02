@@ -33,19 +33,6 @@ jobs:
           [[ "$(uname -s)" == "Darwin" ]]
           [[ "$(uname -m)" == "arm64" ]]
           xcodebuild -version
-          swift --version
-          xcode_major="$(xcodebuild -version | awk 'NR == 1 { split($2, version, "."); print version[1] }')"
-          if (( xcode_major < 26 )); then
-            echo "::error::Xcode 26 or newer is required; this runner has Xcode ${xcode_major}."
-            exit 1
-          fi
-
-      - name: Check out pinned speech-swift dependency
-        uses: actions/checkout@v4
-        with:
-          repository: soniqo/speech-swift
-          path: speech-swift
-          ref: aa0c0dacfc14778c4b9a20f0a67095eb75a3df85
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -77,34 +64,27 @@ jobs:
         working-directory: speech-studio
         run: pnpm install --frozen-lockfile
 
-      - name: Build Swift sidecar
-        working-directory: speech-studio/swift-sidecar
-        run: swift build -c release --build-tests -Xswiftc -enable-testing
-
-      - name: Stage sidecar and MLX metallib
+      - name: Stage official v0.0.11 sidecar and MLX metallib
         env:
-          SPEECH_SWIFT_RELEASE: v0.0.18
+          SPEECH_STUDIO_RELEASE: v0.0.11
         working-directory: speech-studio
         run: |
           set -euo pipefail
-          mkdir -p src-tauri/binaries
-          cp swift-sidecar/.build/release/soniqo-tts-sidecar \
-             src-tauri/binaries/soniqo-tts-sidecar-aarch64-apple-darwin
+          runtime_dir="${RUNNER_TEMP}/speech-studio-runtime-${GITHUB_RUN_ID}"
+          mkdir -p "$runtime_dir" src-tauri/binaries
           curl -sSL --fail \
-            "https://github.com/soniqo/speech-swift/releases/download/${SPEECH_SWIFT_RELEASE}/speech-macos-arm64.tar.gz" \
-            -o /tmp/speech-release.tar.gz
-          tar -xzf /tmp/speech-release.tar.gz -C /tmp mlx.metallib
-          cp /tmp/mlx.metallib src-tauri/binaries/mlx.metallib
-          cp /tmp/mlx.metallib swift-sidecar/.build/release/mlx.metallib
-          for test_dir in swift-sidecar/.build/release/*.xctest/Contents/MacOS; do
-            if [[ -d "$test_dir" ]]; then
-              cp /tmp/mlx.metallib "$test_dir/"
-            fi
-          done
-
-      - name: Run Swift audio tests
-        working-directory: speech-studio/swift-sidecar
-        run: swift test -c release --skip-build --filter AudioPostprocessingTests
+            "https://github.com/soniqo/speech-studio/releases/download/${SPEECH_STUDIO_RELEASE}/Speech-Studio_0.0.11_aarch64.app.tar.gz" \
+            -o "$runtime_dir/Speech-Studio.app.tar.gz"
+          tar -xzf "$runtime_dir/Speech-Studio.app.tar.gz" -C "$runtime_dir"
+          cp "$runtime_dir/Speech Studio.app/Contents/MacOS/soniqo-tts-sidecar" \
+             src-tauri/binaries/soniqo-tts-sidecar-aarch64-apple-darwin
+          cp "$runtime_dir/Speech Studio.app/Contents/Resources/mlx.metallib" \
+             src-tauri/binaries/mlx.metallib
+          chmod +x src-tauri/binaries/soniqo-tts-sidecar-aarch64-apple-darwin
+          file src-tauri/binaries/soniqo-tts-sidecar-aarch64-apple-darwin
+          shasum -a 256 \
+            src-tauri/binaries/soniqo-tts-sidecar-aarch64-apple-darwin \
+            src-tauri/binaries/mlx.metallib
 
       - name: Run Rust tests
         working-directory: speech-studio/src-tauri
@@ -118,19 +98,33 @@ jobs:
         working-directory: speech-studio
         run: pnpm exec tsc --noEmit
 
-      - name: Build unsigned app and DMG
+      - name: Build and ad-hoc sign custom app and DMG
         working-directory: speech-studio
         run: |
           set -euo pipefail
-          if ! pnpm tauri build; then
-            echo "::warning::Bundle creation failed once; cleaning stale disk images and retrying."
-            while IFS= read -r device; do
-              [[ -n "$device" ]] || continue
-              hdiutil detach "$device" || hdiutil detach -force "$device" || true
-            done < <(hdiutil info | awk '/\/Volumes\/Speech Studio/ { print $1 }' | sort -u)
-            rm -f src-tauri/target/release/bundle/dmg/rw.*.dmg
-            pnpm tauri build
+          pnpm tauri build --bundles app --config src-tauri/tauri.paragraph-mode.conf.json
+
+          app="src-tauri/target/release/bundle/macos/Speech Studio Paragraph Mode.app"
+          if [[ ! -e "$app/Contents/MacOS/mlx.metallib" ]]; then
+            ln -s ../Resources/mlx.metallib "$app/Contents/MacOS/mlx.metallib"
           fi
+          codesign --force --sign - --options runtime \
+            --entitlements src-tauri/Entitlements.sidecar.plist \
+            "$app/Contents/MacOS/soniqo-tts-sidecar"
+          codesign --force --sign - --options runtime \
+            --entitlements src-tauri/Entitlements.app.plist "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+          dmg_root="${RUNNER_TEMP}/speech-studio-paragraph-dmg-${GITHUB_RUN_ID}"
+          dmg_dir="src-tauri/target/release/bundle/dmg"
+          dmg="$dmg_dir/Speech-Studio-Paragraph-Mode_0.0.11_aarch64.dmg"
+          mkdir -p "$dmg_root" "$dmg_dir"
+          ditto "$app" "$dmg_root/Speech Studio Paragraph Mode.app"
+          ln -s /Applications "$dmg_root/Applications"
+          hdiutil create -volname "Speech Studio Paragraph Mode" \
+            -srcfolder "$dmg_root" -format UDZO -ov "$dmg"
+          hdiutil verify "$dmg"
+          shasum -a 256 "$dmg"
 
       - name: Upload Apple Silicon DMG
         uses: actions/upload-artifact@v4

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Speech Studio Paragraph Mode",
+  "identifier": "audio.soniqo.studio.paragraph-mode",
+  "app": {
+    "windows": [
+      {
+        "title": "Speech Studio Paragraph Mode",
+        "width": 1280,
+        "height": 800
+      }
+    ]
+  }
+}
