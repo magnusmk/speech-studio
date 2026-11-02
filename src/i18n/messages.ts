@@ -300,6 +300,8 @@ const en = {
     dictateTranscribing: "…",
     dictateTitle: "Dictate this line with the microphone",
     dictateStopTitle: "Stop recording and transcribe into the line",
+    paragraphModeHint:
+      "Full narration script: one Enter starts a new speech segment; an empty line adds a longer pause. Individual paragraphs over 70 words may be split for stability.",
     styleHints: {
       instruction: "Markers steer this line's tone.",
       controlledVocabulary:
@@ -592,6 +594,8 @@ const ru: typeof en = {
     dictateTranscribing: "…",
     dictateTitle: "Надиктовать реплику микрофоном",
     dictateStopTitle: "Остановить запись и распознать в реплику",
+    paragraphModeHint:
+      "Полный текст дикторской речи: Enter начинает новый речевой фрагмент, а пустая строка добавляет более длинную паузу. Для стабильности абзацы длиннее 70 слов могут быть разделены.",
     styleHints: {
       instruction: "Маркеры управляют интонацией этой реплики.",
       controlledVocabulary:

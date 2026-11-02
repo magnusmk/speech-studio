@@ -22,6 +22,8 @@ export function useUpdater() {
   const updateRef = useRef<Update | null>(null);
 
   useEffect(() => {
+    // Custom builds must not replace themselves from the upstream release feed.
+    if (import.meta.env.VITE_DISABLE_SPEECH_STUDIO_UPDATES === "1") return;
     let cancelled = false;
     (async () => {
       try {

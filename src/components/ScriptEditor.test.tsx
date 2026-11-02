@@ -192,6 +192,30 @@ describe("ScriptEditor", () => {
     expect(palette.queryAllByRole("button")).toHaveLength(0);
   });
 
+  it("shows paragraph-mode guidance only for VoxCPM2", () => {
+    useProjectStore.setState({
+      model: {
+        engine: "voxcpm2",
+        language: "en",
+        engines: [engineInfo({ id: "voxcpm2", displayName: "VoxCPM2" })],
+        status: "ready",
+      },
+    });
+    const { rerender } = render(<ScriptEditor value="First.\n\nSecond." onChange={() => {}} />);
+    expect(screen.getByText(/empty line adds a longer pause/i)).toBeInTheDocument();
+
+    useProjectStore.setState({
+      model: {
+        engine: "cosyvoice",
+        language: "en",
+        engines: [engineInfo({ id: "cosyvoice", displayName: "CosyVoice 3" })],
+        status: "ready",
+      },
+    });
+    rerender(<ScriptEditor value="First.\n\nSecond." onChange={() => {}} />);
+    expect(screen.queryByText(/empty line adds a longer pause/i)).not.toBeInTheDocument();
+  });
+
   it("starts recording when the mic is clicked on an idle editor", () => {
     const start = vi.fn();
     mockRecorder({ recording: false, start });

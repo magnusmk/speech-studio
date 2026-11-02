@@ -154,8 +154,13 @@ export function ScriptEditor({ value, onChange }: ScriptEditorProps) {
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={m.script.placeholder}
-        className="min-h-[88px]"
+        className="min-h-[240px] max-h-[600px] resize-y"
       />
+      {engineInfo?.id === "voxcpm2" && (
+        <div className="text-[11px] text-muted-foreground">
+          {m.script.paragraphModeHint}
+        </div>
+      )}
       {dictationError && (
         <div className="text-[11px] text-destructive">{dictationError}</div>
       )}

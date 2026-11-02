@@ -1,0 +1,126 @@
+name: Paragraph Mode macOS
+
+on:
+  push:
+    branches: [feat/voxcpm2-paragraph-mode]
+  workflow_dispatch:
+
+concurrency:
+  group: paragraph-mode-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-macos-arm64:
+    name: Test and build Apple Silicon DMG
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      VITE_DISABLE_SPEECH_STUDIO_UPDATES: "1"
+
+    steps:
+      - name: Check out speech-studio
+        uses: actions/checkout@v4
+        with:
+          path: speech-studio
+
+      - name: Check out pinned speech-swift dependency
+        uses: actions/checkout@v4
+        with:
+          repository: soniqo/speech-swift
+          path: speech-swift
+          ref: aa0c0dacfc14778c4b9a20f0a67095eb75a3df85
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            speech-studio/src-tauri/target
+          key: paragraph-mode-cargo-${{ runner.os }}-${{ hashFiles('speech-studio/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            paragraph-mode-cargo-${{ runner.os }}-
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: speech-studio/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: speech-studio
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Swift sidecar
+        working-directory: speech-studio/swift-sidecar
+        run: swift build -c release --build-tests -Xswiftc -enable-testing
+
+      - name: Stage sidecar and MLX metallib
+        env:
+          SPEECH_SWIFT_RELEASE: v0.0.18
+        working-directory: speech-studio
+        run: |
+          set -euo pipefail
+          mkdir -p src-tauri/binaries
+          cp swift-sidecar/.build/release/soniqo-tts-sidecar \
+             src-tauri/binaries/soniqo-tts-sidecar-aarch64-apple-darwin
+          curl -sSL --fail \
+            "https://github.com/soniqo/speech-swift/releases/download/${SPEECH_SWIFT_RELEASE}/speech-macos-arm64.tar.gz" \
+            -o /tmp/speech-release.tar.gz
+          tar -xzf /tmp/speech-release.tar.gz -C /tmp mlx.metallib
+          cp /tmp/mlx.metallib src-tauri/binaries/mlx.metallib
+          cp /tmp/mlx.metallib swift-sidecar/.build/release/mlx.metallib
+          for test_dir in swift-sidecar/.build/release/*.xctest/Contents/MacOS; do
+            if [[ -d "$test_dir" ]]; then
+              cp /tmp/mlx.metallib "$test_dir/"
+            fi
+          done
+
+      - name: Run Swift audio tests
+        working-directory: speech-studio/swift-sidecar
+        run: swift test -c release --skip-build --filter AudioPostprocessingTests
+
+      - name: Run Rust tests
+        working-directory: speech-studio/src-tauri
+        run: cargo test --lib
+
+      - name: Run frontend tests
+        working-directory: speech-studio
+        run: pnpm test
+
+      - name: Type-check frontend
+        working-directory: speech-studio
+        run: pnpm exec tsc --noEmit
+
+      - name: Build unsigned app and DMG
+        working-directory: speech-studio
+        run: |
+          set -euo pipefail
+          if ! pnpm tauri build; then
+            echo "::warning::Bundle creation failed once; cleaning stale disk images and retrying."
+            while IFS= read -r device; do
+              [[ -n "$device" ]] || continue
+              hdiutil detach "$device" || hdiutil detach -force "$device" || true
+            done < <(hdiutil info | awk '/\/Volumes\/Speech Studio/ { print $1 }' | sort -u)
+            rm -f src-tauri/target/release/bundle/dmg/rw.*.dmg
+            pnpm tauri build
+          fi
+
+      - name: Upload Apple Silicon DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: speech-studio-paragraph-mode-macos-arm64-dmg
+          path: speech-studio/src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 30

@@ -1850,6 +1850,68 @@ fn synth_one_line(
     Ok((audio_path, duration))
 }
 
+// Paragraph narration (VoxCPM2 only): a newline is a deliberate
+// boundary, an empty line asks for a longer pause. Unlike generic long-form
+// chunking, do not interrupt an ordinary sentence just because it hit 14 words.
+// Exception: >70-word individual paragraphs are split conservatively to cap
+// pathological autoregressive generations. Authors can insert line breaks to
+// choose the boundary themselves. The full transcript remains a single clip.
+fn paragraph_chunks_for_synthesis(text: &str) -> (Vec<String>, Vec<f64>) {
+    const MAX_PARAGRAPH_WORDS: usize = 70;
+    const LINE_GAP_SEC: f64 = 0.12;
+    const EMPTY_LINE_GAP_SEC: f64 = 0.55;
+    const SAFETY_SPLIT_GAP_SEC: f64 = 0.18;
+
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut chunks = Vec::new();
+    let mut gaps_before = Vec::new();
+    let mut empty_lines = 0usize;
+    for line in normalized.split('\n') {
+        let line = line.trim();
+        if line.is_empty() {
+            empty_lines += 1;
+            continue;
+        }
+        let sections = if synthesis_word_count(line) > MAX_PARAGRAPH_WORDS {
+            chunk_text_for_synthesis(line, MAX_PARAGRAPH_WORDS)
+        } else {
+            vec![line.to_string()]
+        };
+        for (index, section) in sections.into_iter().enumerate() {
+            let gap = if chunks.is_empty() {
+                0.0
+            } else if index > 0 {
+                SAFETY_SPLIT_GAP_SEC
+            } else if empty_lines > 0 {
+                EMPTY_LINE_GAP_SEC
+            } else {
+                LINE_GAP_SEC
+            };
+            chunks.push(section);
+            gaps_before.push(gap);
+        }
+        empty_lines = 0;
+    }
+    (chunks, gaps_before)
+}
+
+fn chunks_for_synthesis(
+    engine: TtsEngine,
+    text: &str,
+    chunk_word_limit: usize,
+) -> (bool, Vec<String>, Vec<f64>) {
+    let paragraph_mode =
+        engine == TtsEngine::VoxCPM2 && (text.contains('\n') || text.contains('\r'));
+    if paragraph_mode {
+        let (chunks, gaps_before) = paragraph_chunks_for_synthesis(text);
+        (true, chunks, gaps_before)
+    } else {
+        let chunks = chunk_text_for_synthesis(text, chunk_word_limit);
+        let gaps_before = vec![CHUNK_GAP_SEC; chunks.len()];
+        (false, chunks, gaps_before)
+    }
+}
+
 /// Words per synthesis chunk. Most AR engines stay clean around ~14 words
 /// (≈4-7 s of speech). Indic-Mio's current LiteRT prefill graph has a
 /// 64-token prompt bucket including the chat template, and dense Devanagari
@@ -2062,10 +2124,10 @@ async fn synthesize_clip(
         .to_string_lossy()
         .into_owned();
 
-    // Period→comma preprocessing was a CosyVoice-specific workaround for its
-    // EOS attractor on inline periods. VoxCPM2 doesn't share that quirk, but
-    // keeping the preprocess is harmless and stays useful if we fall back.
-    let processed_text = preprocess_target(&args.text);
+    // Period→comma preprocessing is a legacy CosyVoice EOS workaround kept for
+    // the existing engines. VoxCPM2 doesn't share that quirk, so paragraph
+    // narration preserves its sentence periods.
+    let processed_text = preprocess_target_for_engine(args.engine, &args.text);
     if processed_text != args.text {
         studio_log!(
             "[synth] clip {} preprocessed text: {:?} -> {:?}",
@@ -2085,7 +2147,8 @@ async fn synthesize_clip(
     // the direct path (identical to the previous behavior).
     let (chunk_source, suffix_marker) = normalize_synthesis_text(args.engine, &processed_text);
     let chunk_word_limit = max_chunk_words(args.engine);
-    let mut chunks = chunk_text_for_synthesis(&chunk_source, chunk_word_limit);
+    let (paragraph_mode, mut chunks, gaps_before) =
+        chunks_for_synthesis(args.engine, &chunk_source, chunk_word_limit);
     if let Some(marker) = suffix_marker.as_deref() {
         for chunk in &mut chunks {
             if args.engine == TtsEngine::FishAudio {
@@ -2121,9 +2184,14 @@ async fn synthesize_clip(
     }
 
     studio_log!(
-        "[synth] clip {} long-form: {} chunks (≤{} words each)",
+        "[synth] clip {} long-form: {} chunks (mode={}, default limit={} words)",
         args.clip_id,
         chunks.len(),
+        if paragraph_mode {
+            "paragraph"
+        } else {
+            "automatic"
+        },
         chunk_word_limit
     );
     let mut rendered: Vec<Vec<f32>> = Vec::new();
@@ -2167,8 +2235,9 @@ async fn synthesize_clip(
     let mut combined: Vec<f32> = Vec::new();
     for (i, chunk) in rendered.iter().enumerate() {
         if i > 0 {
-            let gap = (rate as f64 * CHUNK_GAP_SEC) as usize;
-            combined.extend(std::iter::repeat(0.0f32).take(gap));
+            let gap_seconds = gaps_before.get(i).copied().unwrap_or(CHUNK_GAP_SEC);
+            let gap_samples = (rate as f64 * gap_seconds) as usize;
+            combined.extend(std::iter::repeat(0.0f32).take(gap_samples));
         }
         combined.extend_from_slice(chunk);
     }
@@ -2228,6 +2297,14 @@ fn preprocess_target(text: &str) -> String {
     let original_trailing = &text[trimmed_end.len()..];
     out.push_str(original_trailing);
     out
+}
+
+fn preprocess_target_for_engine(engine: TtsEngine, text: &str) -> String {
+    if engine == TtsEngine::VoxCPM2 {
+        text.to_string()
+    } else {
+        preprocess_target(text)
+    }
 }
 
 fn is_style_tag_name(tag: &str) -> bool {
@@ -3834,6 +3911,80 @@ mod tests {
         let hindi = "नमस्ते आज मौसम अच्छा है।";
         assert_eq!(synthesis_text_length(hindi), (canon_tokens(hindi).len(), 0));
         assert_eq!(synth_max_tokens(TtsEngine::Qwen3, "Hello 日本語 world"), 40);
+    }
+
+    // A complete transcript can be pasted into one clip. Only
+    // deliberate newlines (or a >70-word safety fallback) define its sections.
+    #[test]
+    fn voxcpm2_paragraphs_respect_manual_line_breaks() {
+        let script = "There's a particular expression people make when they realise they might be wrong.\r\nNot to discover the truth, but to avoid it.\r\n\r\nA remarkable talent, really.";
+        let (chunks, gaps) = paragraph_chunks_for_synthesis(script);
+        assert_eq!(chunks, [
+            "There's a particular expression people make when they realise they might be wrong.",
+            "Not to discover the truth, but to avoid it.",
+            "A remarkable talent, really.",
+        ]);
+        assert_eq!(gaps, [0.0, 0.12, 0.55]);
+    }
+
+    #[test]
+    fn voxcpm2_keeps_longer_sentences_in_one_paragraph() {
+        let paragraph = (0..32).map(|_| "narration").collect::<Vec<_>>().join(" ");
+        let (chunks, gaps) =
+            paragraph_chunks_for_synthesis(&format!("{}\nAnd now we continue.", paragraph));
+        assert_eq!(chunks, [paragraph, "And now we continue.".to_string()]);
+        assert_eq!(gaps, [0.0, 0.12]);
+    }
+
+    #[test]
+    fn voxcpm2_long_paragraphs_have_a_safety_cap() {
+        let paragraph = (0..79).map(|_| "word").collect::<Vec<_>>().join(" ");
+        let (chunks, gaps) = paragraph_chunks_for_synthesis(&paragraph);
+        assert!(chunks.len() >= 2);
+        assert!(chunks.iter().all(|chunk| synthesis_word_count(chunk) <= 70));
+        assert_eq!(chunks.join(" "), paragraph);
+        assert_eq!(gaps.len(), chunks.len());
+        assert_eq!(gaps[1], 0.18);
+    }
+
+    #[test]
+    fn paragraph_mode_does_not_change_other_tts_engines() {
+        let text = format!("{}\n{}", "first ".repeat(18), "second ".repeat(18));
+        for engine in [
+            TtsEngine::CosyVoice,
+            TtsEngine::Qwen3,
+            TtsEngine::Chatterbox,
+            TtsEngine::OmniVoice,
+            TtsEngine::IndicMio,
+            TtsEngine::FishAudio,
+        ] {
+            let limit = max_chunk_words(engine);
+            let expected = chunk_text_for_synthesis(&text, limit);
+            let (paragraph_mode, chunks, gaps) = chunks_for_synthesis(engine, &text, limit);
+            assert!(!paragraph_mode, "unexpected paragraph mode for {engine:?}");
+            assert_eq!(chunks, expected, "chunking changed for {engine:?}");
+            assert_eq!(gaps, vec![CHUNK_GAP_SEC; chunks.len()]);
+        }
+    }
+
+    #[test]
+    fn only_voxcpm2_preserves_inline_periods() {
+        let text = "First sentence. Second sentence.";
+        assert_eq!(preprocess_target_for_engine(TtsEngine::VoxCPM2, text), text);
+        for engine in [
+            TtsEngine::CosyVoice,
+            TtsEngine::Qwen3,
+            TtsEngine::Chatterbox,
+            TtsEngine::OmniVoice,
+            TtsEngine::IndicMio,
+            TtsEngine::FishAudio,
+        ] {
+            assert_eq!(
+                preprocess_target_for_engine(engine, text),
+                preprocess_target(text),
+                "preprocessing changed for {engine:?}"
+            );
+        }
     }
 
     #[test]
